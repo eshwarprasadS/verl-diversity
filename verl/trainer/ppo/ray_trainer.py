@@ -108,6 +108,69 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def _filter_zero_variance_groups(batch: DataProto, metrics: dict) -> DataProto:
+    """DAPO Dynamic Sampling: zero-mask advantages for groups with no reward variance."""
+    import numpy as np
+
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return batch
+
+    scores = batch.batch["token_level_scores"].sum(dim=-1).float()
+    unique_uids = set(uids)
+    n_filtered = 0
+    for uid in unique_uids:
+        mask = np.array([u == uid for u in uids])
+        group_scores = scores[mask]
+        if group_scores.std().item() < 1e-8:
+            batch.batch["advantages"][mask] = 0.0
+            n_filtered += 1
+
+    metrics["s4/zero_variance_groups_filtered"] = n_filtered
+    metrics["s4/zero_variance_groups_ratio"] = n_filtered / max(len(unique_uids), 1)
+    return batch
+
+
+def _pods_max_variance_select(batch: DataProto, k: int, n: int, metrics: dict) -> DataProto:
+    """PODS: select k-of-n rollouts per group that maximize reward variance."""
+    import numpy as np
+
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return batch
+
+    scores = batch.batch["token_level_scores"].sum(dim=-1).float()
+    unique_uids = list(dict.fromkeys(uids))
+    keep_indices = []
+
+    for uid in unique_uids:
+        uid_mask = np.array([u == uid for u in uids])
+        uid_indices = np.where(uid_mask)[0]
+        group_scores = scores[uid_indices]
+
+        if len(uid_indices) <= k:
+            keep_indices.extend(uid_indices.tolist())
+            continue
+
+        sorted_idx = group_scores.argsort(descending=True)
+        best_indices = sorted_idx[:k].tolist()
+        best_var = group_scores[best_indices].var().item()
+
+        for i in range(k):
+            candidate = sorted_idx[:i].tolist() + sorted_idx[i - k :].tolist()
+            candidate_var = group_scores[candidate].var().item()
+            if candidate_var > best_var:
+                best_var = candidate_var
+                best_indices = candidate
+
+        keep_indices.extend(uid_indices[best_indices].tolist())
+
+    keep_indices.sort()
+    batch = batch[keep_indices]
+    metrics["s4/pods_kept_ratio"] = len(keep_indices) / max(len(uids), 1)
+    return batch
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -1492,6 +1555,20 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # --- S4: DAPO Dynamic Sampling ---
+                        # Zero-mask advantages for groups with zero reward variance
+                        # (all-correct or all-wrong → no learning signal)
+                        if self.config.algorithm.get("filter_zero_variance_groups", False):
+                            batch = _filter_zero_variance_groups(batch, metrics)
+
+                        # --- S4: PODS Max-Variance Down-Sampling ---
+                        # Select the subset of rollouts per group that maximizes reward variance
+                        pods_k = self.config.algorithm.get("pods_num_generations_grad", 0)
+                        if pods_k > 0 and pods_k < self.config.actor_rollout_ref.rollout.n:
+                            batch = _pods_max_variance_select(
+                                batch, pods_k, self.config.actor_rollout_ref.rollout.n, metrics
+                            )
 
                     # update critic
                     if self.use_critic:
