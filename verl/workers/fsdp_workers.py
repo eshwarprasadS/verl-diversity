@@ -706,7 +706,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.rollout_device_mesh = rollout_device_mesh
 
-        if rollout_name == "hf":
+        if rollout_name in ("hf", "kt", "eptree"):
+            # Sync-mode rollouts: each GPU runs independently, no infer_tp/infer_pp grouping
             self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         else:
             is_collect = (
@@ -719,9 +720,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_name == "kt":
+            from verl.workers.rollout.latr import KTRollout
+
+            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+            self.rollout = KTRollout(
+                module=self.actor_module_fsdp, path=local_path, config=self.config.rollout
+            )
+        elif rollout_name == "eptree":
+            from verl.workers.rollout.latr import EptreeRollout
+
+            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+            self.rollout = EptreeRollout(
+                module=self.actor_module_fsdp, path=local_path, config=self.config.rollout
+            )
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
