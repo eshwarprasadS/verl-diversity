@@ -171,6 +171,83 @@ def _pods_max_variance_select(batch: DataProto, k: int, n: int, metrics: dict) -
     return batch
 
 
+def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) -> None:
+    """Compute L1-L4 diversity metrics for the analysis paper.
+
+    Adds metrics to the metrics dict in-place. Does not modify the batch.
+    """
+    import re
+    import numpy as np
+
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return
+
+    responses = batch.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = batch.batch["attention_mask"][:, -response_length:]
+    scores = batch.batch["token_level_scores"].sum(dim=-1).float()
+
+    unique_uids = list(dict.fromkeys(uids))
+    n_groups = len(unique_uids)
+
+    # --- L2: Response length variance per group ---
+    response_lengths = attention_mask.sum(dim=-1).float()
+    l2_len_vars = []
+    for uid in unique_uids:
+        mask = np.array([u == uid for u in uids])
+        group_lens = response_lengths[mask]
+        if len(group_lens) > 1:
+            l2_len_vars.append(group_lens.var().item())
+    metrics["diversity/L2_response_len_var"] = np.mean(l2_len_vars) if l2_len_vars else 0.0
+
+    # --- L4: Distinct answers per group ---
+    boxed_pattern = re.compile(r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
+    l4_distinct_answers = []
+    l4_outcome_entropies = []
+
+    for uid in unique_uids:
+        mask = np.array([u == uid for u in uids])
+        group_scores = scores[mask]
+
+        # Extract boxed answers if tokenizer is available
+        if tokenizer is not None:
+            group_responses = responses[mask]
+            answers = set()
+            for resp in group_responses:
+                text = tokenizer.decode(resp, skip_special_tokens=True)
+                matches = boxed_pattern.findall(text)
+                if matches:
+                    answers.add(matches[-1].strip())
+                else:
+                    answers.add("__no_answer__")
+            l4_distinct_answers.append(len(answers))
+
+        # L4 outcome entropy: H = -p*log(p) - (1-p)*log(1-p) where p = pass rate
+        g = len(group_scores)
+        if g > 0:
+            p = group_scores.mean().item()
+            if 0 < p < 1:
+                h = -(p * np.log(p) + (1 - p) * np.log(1 - p))
+            else:
+                h = 0.0
+            l4_outcome_entropies.append(h)
+
+    if l4_distinct_answers:
+        metrics["diversity/L4_distinct_answers"] = np.mean(l4_distinct_answers)
+    metrics["diversity/L4_outcome_entropy"] = np.mean(l4_outcome_entropies) if l4_outcome_entropies else 0.0
+
+    # --- Wasted compute ---
+    total_tokens = response_lengths.sum().item()
+    wasted_tokens = 0.0
+    for uid in unique_uids:
+        mask = np.array([u == uid for u in uids])
+        group_scores = scores[mask]
+        if group_scores.std().item() < 1e-8:
+            wasted_tokens += response_lengths[mask].sum().item()
+    metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -1569,6 +1646,9 @@ class RayPPOTrainer:
                             batch = _pods_max_variance_select(
                                 batch, pods_k, self.config.actor_rollout_ref.rollout.n, metrics
                             )
+
+                        # --- Diversity metrics (L2, L4, wasted compute) ---
+                        _compute_diversity_metrics(batch, metrics, tokenizer=self.tokenizer)
 
                     # update critic
                     if self.use_critic:
