@@ -251,9 +251,10 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
             if group_scores.mean().item() > 0.5:
                 saturated_groups += 1
     metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
-    metrics["productivity/yield"] = (n_groups - dead_groups) / max(n_groups, 1)
+    metrics["productivity/rate"] = (n_groups - dead_groups) / max(n_groups, 1)
     metrics["productivity/dead_rate"] = dead_groups / max(n_groups, 1)
     metrics["productivity/saturated_rate"] = saturated_groups / max(n_groups, 1)
+    metrics["productivity/frontier_rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
 
 
 def compute_response_mask(data: DataProto):
