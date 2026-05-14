@@ -171,11 +171,15 @@ def _pods_max_variance_select(batch: DataProto, k: int, n: int, metrics: dict) -
     return batch
 
 
-def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) -> None:
-    """Compute L1-L4 diversity metrics for the analysis paper.
+def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None,
+                               global_step: int = -1, experiment_name: str = "",
+                               log_dir: str = "") -> None:
+    """Compute L1-L4 diversity and group productivity metrics.
 
-    Adds metrics to the metrics dict in-place. Does not modify the batch.
+    Logs per-problem pass rates to a sidecar CSV for signal quality analysis.
     """
+    import csv
+    import os
     import re
     import numpy as np
 
@@ -201,7 +205,7 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
             l2_len_vars.append(group_lens.var().item())
     metrics["diversity/L2_response_len_var"] = np.mean(l2_len_vars) if l2_len_vars else 0.0
 
-    # --- L4: Distinct answers per group ---
+    # --- L4: Distinct answers + outcome entropy per group ---
     boxed_pattern = re.compile(r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}')
     l4_distinct_answers = []
     l4_outcome_entropies = []
@@ -210,7 +214,6 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
         mask = np.array([u == uid for u in uids])
         group_scores = scores[mask]
 
-        # Extract boxed answers if tokenizer is available
         if tokenizer is not None:
             group_responses = responses[mask]
             answers = set()
@@ -223,7 +226,6 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
                     answers.add("__no_answer__")
             l4_distinct_answers.append(len(answers))
 
-        # L4 outcome entropy: H = -p*log(p) - (1-p)*log(1-p) where p = pass rate
         g = len(group_scores)
         if g > 0:
             p = group_scores.mean().item()
@@ -242,19 +244,47 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
     wasted_tokens = 0.0
     dead_groups = 0
     saturated_groups = 0
+    reward_vars = []
+    problem_rows = []
+
     for uid in unique_uids:
         mask = np.array([u == uid for u in uids])
         group_scores = scores[mask]
-        if group_scores.std().item() < 1e-8:
+        g = len(group_scores)
+        p = group_scores.mean().item()
+        v = group_scores.var().item() if g > 1 else 0.0
+        reward_vars.append(v)
+
+        is_dead = v < 1e-8
+        if is_dead:
             wasted_tokens += response_lengths[mask].sum().item()
             dead_groups += 1
-            if group_scores.mean().item() > 0.5:
+            if p > 0.5:
                 saturated_groups += 1
+
+        if global_step >= 0:
+            state = "saturated" if (is_dead and p > 0.5) else ("dead" if is_dead else "frontier")
+            problem_rows.append((global_step, uid, round(p, 4), state, g))
+
     metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
     metrics["productivity/rate"] = (n_groups - dead_groups) / max(n_groups, 1)
     metrics["productivity/dead_rate"] = dead_groups / max(n_groups, 1)
     metrics["productivity/saturated_rate"] = saturated_groups / max(n_groups, 1)
     metrics["productivity/frontier_rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
+    metrics["productivity/reward_var_mean"] = float(np.mean(reward_vars)) if reward_vars else 0.0
+
+    # --- Per-problem sidecar CSV ---
+    if problem_rows and log_dir:
+        csv_path = os.path.join(log_dir, f"{experiment_name}_problem_states.csv")
+        write_header = not os.path.exists(csv_path)
+        try:
+            with open(csv_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(["step", "uid", "pass_rate", "state", "group_size"])
+                w.writerows(problem_rows)
+        except OSError:
+            pass
 
 
 def compute_response_mask(data: DataProto):
@@ -1657,7 +1687,12 @@ class RayPPOTrainer:
                             )
 
                         # --- Diversity metrics (L2, L4, wasted compute) ---
-                        _compute_diversity_metrics(batch, metrics, tokenizer=self.tokenizer)
+                        _compute_diversity_metrics(
+                            batch, metrics, tokenizer=self.tokenizer,
+                            global_step=self.global_steps,
+                            experiment_name=self.config.trainer.experiment_name,
+                            log_dir=self.config.trainer.default_local_dir,
+                        )
 
                     # update critic
                     if self.use_critic:
@@ -1764,6 +1799,8 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+                    if hasattr(self.train_dataloader.sampler, 'target_difficulty'):
+                        metrics["curriculum/target_difficulty"] = self.train_dataloader.sampler.target_difficulty
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
