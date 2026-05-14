@@ -258,16 +258,17 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None,
         is_dead = v < 1e-8
         if is_dead:
             wasted_tokens += response_lengths[mask].sum().item()
-            dead_groups += 1
             if p > 0.5:
                 saturated_groups += 1
+            else:
+                dead_groups += 1
 
         if global_step >= 0:
             state = "saturated" if (is_dead and p > 0.5) else ("dead" if is_dead else "frontier")
             problem_rows.append((global_step, uid, round(p, 4), state, g))
 
     metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
-    metrics["productivity/rate"] = (n_groups - dead_groups) / max(n_groups, 1)
+    metrics["productivity/rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
     metrics["productivity/dead_rate"] = dead_groups / max(n_groups, 1)
     metrics["productivity/saturated_rate"] = saturated_groups / max(n_groups, 1)
     metrics["productivity/frontier_rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
