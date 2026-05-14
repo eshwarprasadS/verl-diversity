@@ -237,15 +237,23 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None) 
         metrics["diversity/L4_distinct_answers"] = np.mean(l4_distinct_answers)
     metrics["diversity/L4_outcome_entropy"] = np.mean(l4_outcome_entropies) if l4_outcome_entropies else 0.0
 
-    # --- Wasted compute ---
+    # --- Group productivity metrics ---
     total_tokens = response_lengths.sum().item()
     wasted_tokens = 0.0
+    dead_groups = 0
+    saturated_groups = 0
     for uid in unique_uids:
         mask = np.array([u == uid for u in uids])
         group_scores = scores[mask]
         if group_scores.std().item() < 1e-8:
             wasted_tokens += response_lengths[mask].sum().item()
+            dead_groups += 1
+            if group_scores.mean().item() > 0.5:
+                saturated_groups += 1
     metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
+    metrics["productivity/yield"] = (n_groups - dead_groups) / max(n_groups, 1)
+    metrics["productivity/dead_rate"] = dead_groups / max(n_groups, 1)
+    metrics["productivity/saturated_rate"] = saturated_groups / max(n_groups, 1)
 
 
 def compute_response_mask(data: DataProto):
