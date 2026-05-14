@@ -273,6 +273,44 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None,
     metrics["productivity/frontier_rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
     metrics["productivity/reward_var_mean"] = float(np.mean(reward_vars)) if reward_vars else 0.0
 
+    # --- L3: Strategy diversity (LLM judge, sampled) ---
+    if tokenizer is not None and global_step >= 0:
+        try:
+            from verl.experimental.l3_strategy_judge import classify_strategies, L3_SAMPLE_GROUPS
+            import random as _rng
+            _rng.seed(global_step)
+            sampled_uids = _rng.sample(unique_uids, min(L3_SAMPLE_GROUPS, len(unique_uids)))
+            l3_strategies = []
+            l3_entropies = []
+            _api_key = os.environ.get("OPENAI_API_KEY")
+            for uid in sampled_uids:
+                mask = np.array([u == uid for u in uids])
+                group_responses = responses[mask]
+                problem_text = ""
+                if "prompt_text" in batch.non_tensor_batch:
+                    prompts_for_uid = [batch.non_tensor_batch["prompt_text"][i]
+                                       for i, u in enumerate(uids) if u == uid]
+                    if prompts_for_uid:
+                        problem_text = str(prompts_for_uid[0])[:500]
+                solution_texts = [tokenizer.decode(r, skip_special_tokens=True) for r in group_responses]
+                result = classify_strategies(problem_text, solution_texts, _api_key)
+                if result and "num_distinct" in result:
+                    l3_strategies.append(result["num_distinct"])
+                    labels = result.get("strategies", [])
+                    if labels:
+                        from collections import Counter
+                        counts = Counter(labels)
+                        total = sum(counts.values())
+                        probs = [c / total for c in counts.values()]
+                        ent = -sum(p * np.log(p) for p in probs if p > 0)
+                        l3_entropies.append(ent)
+            if l3_strategies:
+                metrics["diversity/L3_strategies_per_group"] = float(np.mean(l3_strategies))
+            if l3_entropies:
+                metrics["diversity/L3_strategy_entropy"] = float(np.mean(l3_entropies))
+        except Exception:
+            pass
+
     # --- Per-problem sidecar CSV ---
     if problem_rows and log_dir:
         csv_path = os.path.join(log_dir, f"{experiment_name}_problem_states.csv")
