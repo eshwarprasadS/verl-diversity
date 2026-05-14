@@ -272,6 +272,17 @@ class RayHintTrainer(RayPPOTrainer):
                     question = value.strip()
                     break
 
+        # Fallback: extract from chat-format prompt (list of message dicts)
+        if question is None and "prompt" in non_tensor_batch:
+            prompt_val = non_tensor_batch["prompt"][idx]
+            if isinstance(prompt_val, list):
+                for msg in prompt_val:
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and content.strip():
+                            question = content.strip()
+                            break
+
         solution = None
         if "solution" in non_tensor_batch:
             value = non_tensor_batch["solution"][idx]
@@ -286,9 +297,11 @@ class RayHintTrainer(RayPPOTrainer):
             if isinstance(reward_info, dict):
                 for key in ("solution", "ground_truth", "answer"):
                     value = reward_info.get(key)
-                    if isinstance(value, str) and value.strip():
-                        solution = value.strip()
-                        break
+                    if value is not None:
+                        value = str(value).strip()
+                        if value:
+                            solution = value
+                            break
 
         if question is None and "raw_prompt_ids" in gen_batch.non_tensor_batch:
             try:
