@@ -255,16 +255,23 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None,
         v = group_scores.var().item() if g > 1 else 0.0
         reward_vars.append(v)
 
-        is_dead = v < 1e-8
-        if is_dead:
+        n_correct = int(group_scores.sum().item())
+        if n_correct == 0:
             wasted_tokens += response_lengths[mask].sum().item()
-            if p > 0.5:
-                saturated_groups += 1
-            else:
-                dead_groups += 1
+            dead_groups += 1
+        elif n_correct == g:
+            wasted_tokens += response_lengths[mask].sum().item()
+            saturated_groups += 1
+        # is_dead = v < 1e-8
+        # if is_dead:
+        #     wasted_tokens += response_lengths[mask].sum().item()
+        #     if p > 0.5:
+        #         saturated_groups += 1
+        #     else:
+        #         dead_groups += 1
 
         if global_step >= 0:
-            state = "saturated" if (is_dead and p > 0.5) else ("dead" if is_dead else "frontier")
+            state = "saturated" if n_correct == g else ("dead" if n_correct == 0 else "frontier")
             problem_rows.append((global_step, uid, round(p, 4), state, g))
 
     metrics["productivity/wasted_compute"] = wasted_tokens / max(total_tokens, 1)
@@ -273,44 +280,6 @@ def _compute_diversity_metrics(batch: DataProto, metrics: dict, tokenizer=None,
     metrics["productivity/saturated_rate"] = saturated_groups / max(n_groups, 1)
     metrics["productivity/frontier_rate"] = (n_groups - dead_groups - saturated_groups) / max(n_groups, 1)
     metrics["productivity/reward_var_mean"] = float(np.mean(reward_vars)) if reward_vars else 0.0
-
-    # --- L3: Strategy diversity (LLM judge, sampled) ---
-    if tokenizer is not None and global_step >= 0:
-        try:
-            from verl.experimental.l3_strategy_judge import classify_strategies, L3_SAMPLE_GROUPS
-            import random as _rng
-            _rng.seed(global_step)
-            sampled_uids = _rng.sample(unique_uids, min(L3_SAMPLE_GROUPS, len(unique_uids)))
-            l3_strategies = []
-            l3_entropies = []
-            _api_key = os.environ.get("OPENAI_API_KEY")
-            for uid in sampled_uids:
-                mask = np.array([u == uid for u in uids])
-                group_responses = responses[mask]
-                problem_text = ""
-                if "prompt_text" in batch.non_tensor_batch:
-                    prompts_for_uid = [batch.non_tensor_batch["prompt_text"][i]
-                                       for i, u in enumerate(uids) if u == uid]
-                    if prompts_for_uid:
-                        problem_text = str(prompts_for_uid[0])[:500]
-                solution_texts = [tokenizer.decode(r, skip_special_tokens=True) for r in group_responses]
-                result = classify_strategies(problem_text, solution_texts, _api_key)
-                if result and "num_distinct" in result:
-                    l3_strategies.append(result["num_distinct"])
-                    labels = result.get("strategies", [])
-                    if labels:
-                        from collections import Counter
-                        counts = Counter(labels)
-                        total = sum(counts.values())
-                        probs = [c / total for c in counts.values()]
-                        ent = -sum(p * np.log(p) for p in probs if p > 0)
-                        l3_entropies.append(ent)
-            if l3_strategies:
-                metrics["diversity/L3_strategies_per_group"] = float(np.mean(l3_strategies))
-            if l3_entropies:
-                metrics["diversity/L3_strategy_entropy"] = float(np.mean(l3_entropies))
-        except Exception:
-            pass
 
     # --- Per-problem sidecar CSV ---
     if problem_rows and log_dir:
